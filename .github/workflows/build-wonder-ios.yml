@@ -1,0 +1,80 @@
+name: Build Wonder iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wonder-ios-cloud-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate private input secrets
+        env:
+          NSP_ARCHIVE_URL: ${{ secrets.NSP_ARCHIVE_URL }}
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+        run: |
+          test -n "$NSP_ARCHIVE_URL" || { echo "::error::Add the NSP_ARCHIVE_URL Actions secret."; exit 1; }
+          test -n "$PROD_KEYS_B64" || { echo "::error::Add the PROD_KEYS_B64 Actions secret."; exit 1; }
+          case "$NSP_ARCHIVE_URL" in https://*) ;; *) echo "::error::NSP_ARCHIVE_URL must be HTTPS."; exit 1 ;; esac
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen zstd spirv-cross
+          brew install --cask dotnet-sdk
+          xcodebuild -version
+          dotnet --version
+
+      - name: Download private game inputs
+        env:
+          NSP_ARCHIVE_URL: ${{ secrets.NSP_ARCHIVE_URL }}
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nsp-input" "$RUNNER_TEMP/ipa-output"
+          curl --silent --show-error --fail --location "$NSP_ARCHIVE_URL" --output "$RUNNER_TEMP/game-nsps.zip"
+          unzip -q "$RUNNER_TEMP/game-nsps.zip" -d "$RUNNER_TEMP/nsp-input"
+          printf '%s' "$PROD_KEYS_B64" | base64 -D > "$RUNNER_TEMP/prod.keys"
+          chmod 600 "$RUNNER_TEMP/prod.keys"
+          if ! find "$RUNNER_TEMP/nsp-input" -type f -name '*.nsp' | grep -q .; then
+            echo "::error::The ZIP must contain the game NSP files."
+            exit 1
+          fi
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/nx-venv"
+          "$RUNNER_TEMP/nx-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/nx-venv/bin/python" -m pip install lz4 capstone fonttools
+
+      - name: Build unsigned IPA
+        run: |
+          set -euo pipefail
+          NSP_DIR="$RUNNER_TEMP/nsp-input"
+          if ! find "$NSP_DIR" -maxdepth 1 -type f -name '*.nsp' | grep -q .; then
+            child="$(find "$NSP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+            if [ -n "$child" ]; then NSP_DIR="$child"; fi
+          fi
+          "$RUNNER_TEMP/nx-venv/bin/python" scripts/build_ipa_from_nsp.py "$NSP_DIR" -k "$RUNNER_TEMP/prod.keys" -o "$RUNNER_TEMP/ipa-output/Super-Mario-Bros-Wonder.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Super-Mario-Bros-Wonder-iOS-IPA
+          path: ${{ runner.temp }}/ipa-output/*.ipa
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Clean up private game inputs
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/nsp-input" "$RUNNER_TEMP/game-nsps.zip" "$RUNNER_TEMP/prod.keys" "$RUNNER_TEMP/ipa-output" "$RUNNER_TEMP/nx-venv"
